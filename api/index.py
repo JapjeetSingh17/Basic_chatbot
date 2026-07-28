@@ -4,7 +4,6 @@ from typing import Annotated
 from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, END, StateGraph
@@ -15,24 +14,36 @@ from langgraph.types import Command, interrupt
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import uvicorn
 
 load_dotenv()
 
-# Flexibly initialize LLM: use Groq or OpenAI in production (Vercel), fallback to Ollama locally
-groq_api_key = os.getenv("GROQ_API_KEY")
-openai_api_key = os.getenv("OPENAI_API_KEY")
 
-if groq_api_key:
-    from langchain_groq import ChatGroq
-    llm = ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=groq_api_key)
-elif openai_api_key:
-    from langchain_openai import ChatOpenAI
-    llm = ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_api_key)
-else:
-    from langchain_ollama import OllamaLLM
-    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    llm = OllamaLLM(model="llama3.1", base_url=ollama_url)
+def get_llm():
+    """Lazily and safely initialize the LLM to prevent Vercel import failures."""
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if groq_api_key:
+        try:
+            from langchain_groq import ChatGroq
+            return ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=groq_api_key)
+        except Exception:
+            pass
+
+    if openai_api_key:
+        try:
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_api_key)
+        except Exception:
+            pass
+
+    try:
+        from langchain_ollama import OllamaLLM
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        return OllamaLLM(model="llama3.1", base_url=ollama_url)
+    except Exception:
+        from langchain.chat_models import init_chat_model
+        return init_chat_model("llama-3.1-8b-instant", model_provider="groq")
 
 
 class State(TypedDict):
@@ -56,10 +67,11 @@ def human_assistance(query: str) -> str:
 
 
 tools = [calculator, human_assistance]
-llm_with_tools = llm.bind_tools(tools)
 
 
 def chatbot(state: State):
+    llm = get_llm()
+    llm_with_tools = llm.bind_tools(tools)
     return {"messages": llm_with_tools.invoke(state["messages"])}
 
 
@@ -447,11 +459,15 @@ def chat_endpoint(req: ChatRequest):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    html_file = Path(__file__).parent.parent / "chat_agent_html.html"
-    if html_file.exists():
-        return html_file.read_text(encoding="utf-8")
+    try:
+        html_file = Path(__file__).parent.parent / "chat_agent_html.html"
+        if html_file.exists():
+            return html_file.read_text(encoding="utf-8")
+    except Exception:
+        pass
     return HTML_UI
 
 
 if __name__ == "__main__":
-    uvicorn.run("index:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
