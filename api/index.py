@@ -1,120 +1,10 @@
 import os
 from pathlib import Path
-from typing import Annotated
-from typing_extensions import TypedDict
-
-from dotenv import load_dotenv
-from langchain_core.tools import tool
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import START, END, StateGraph
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.types import Command, interrupt
-
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-load_dotenv()
-
-
-def get_llm():
-    """Lazily and safely initialize the LLM to prevent Vercel import failures."""
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-
-    if groq_api_key:
-        try:
-            from langchain_groq import ChatGroq
-            return ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=groq_api_key)
-        except Exception:
-            pass
-
-    if openai_api_key:
-        try:
-            from langchain_openai import ChatOpenAI
-            return ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_api_key)
-        except Exception:
-            pass
-
-    try:
-        from langchain_ollama import OllamaLLM
-        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        return OllamaLLM(model="llama3.1", base_url=ollama_url)
-    except Exception:
-        from langchain.chat_models import init_chat_model
-        return init_chat_model("llama-3.1-8b-instant", model_provider="groq")
-
-
-class State(TypedDict):
-    messages: Annotated[list, add_messages]
-
-
-@tool
-def calculator(expression: str) -> str:
-    """Evaluate a basic math expression, e.g. '12 * (3 + 4)'."""
-    try:
-        return str(eval(expression, {"__builtins__": {}}))
-    except Exception as e:
-        return f"Error: {e}"
-
-
-@tool
-def human_assistance(query: str) -> str:
-    """Ask the human user for help when unsure how to proceed."""
-    human_response = interrupt({"query": query})
-    return human_response["data"]
-
-
-tools = [calculator, human_assistance]
-
-
-def chatbot(state: State):
-    llm = get_llm()
-    llm_with_tools = llm.bind_tools(tools)
-    return {"messages": llm_with_tools.invoke(state["messages"])}
-
-
-graph_builder = StateGraph(State)
-graph_builder.add_node("chatbot", chatbot)
-graph_builder.add_node("tools", ToolNode(tools=tools))
-graph_builder.add_edge(START, "chatbot")
-graph_builder.add_conditional_edges("chatbot", tools_condition)
-graph_builder.add_edge("tools", "chatbot")
-
-memory = MemorySaver()
-graph = graph_builder.compile(checkpointer=memory)
-
-config = {"configurable": {"thread_id": "vercel-session"}}
-waiting_for_human = {"flag": False}
-
-
-def chat_fn(message: str, history=None):
-    if waiting_for_human["flag"]:
-        waiting_for_human["flag"] = False
-        events = graph.stream(
-            Command(resume={"data": message}), config, stream_mode="values"
-        )
-    else:
-        events = graph.stream(
-            {"messages": [{"role": "user", "content": message}]},
-            config,
-            stream_mode="values",
-        )
-
-    last_message = None
-    for event in events:
-        if "messages" in event:
-            last_message = event["messages"][-1]
-
-    state = graph.get_state(config)
-    if state.next:
-        waiting_for_human["flag"] = True
-        pending = state.tasks[0].interrupts[0].value
-        return f"🤖 I need your help: {pending['query']}"
-
-    return last_message.content if last_message else "..."
-
+app = FastAPI(title="LangGraph Agent - Vercel")
 
 # Embedded HTML UI to guarantee Vercel serverless function never fails due to missing static files
 HTML_UI = """<!DOCTYPE html>
@@ -443,18 +333,129 @@ HTML_UI = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- FastAPI Vercel Serverless Application ---
-app = FastAPI(title="LangGraph Agent - Vercel")
+# Cache compiled graph in memory for serverless warm starts
+_cached_graph = None
+_waiting_for_human = {"flag": False}
+_config = {"configurable": {"thread_id": "vercel-session"}}
+
+
+def get_graph():
+    global _cached_graph
+    if _cached_graph is not None:
+        return _cached_graph
+
+    from typing import Annotated
+    from typing_extensions import TypedDict
+    from langchain_core.tools import tool
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import START, END, StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.prebuilt import ToolNode, tools_condition
+    from langgraph.types import Command, interrupt
+
+    class State(TypedDict):
+        messages: Annotated[list, add_messages]
+
+    @tool
+    def calculator(expression: str) -> str:
+        """Evaluate a basic math expression, e.g. '12 * (3 + 4)'."""
+        try:
+            return str(eval(expression, {"__builtins__": {}}))
+        except Exception as e:
+            return f"Error: {e}"
+
+    @tool
+    def human_assistance(query: str) -> str:
+        """Ask the human user for help when unsure how to proceed."""
+        human_response = interrupt({"query": query})
+        return human_response["data"]
+
+    tools = [calculator, human_assistance]
+
+    # Initialize LLM safely
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
+    if groq_api_key:
+        from langchain_groq import ChatGroq
+        llm = ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=groq_api_key)
+    elif openai_api_key:
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_api_key)
+    else:
+        try:
+            from langchain_ollama import OllamaLLM
+            ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            llm = OllamaLLM(model="llama3.1", base_url=ollama_url)
+        except Exception:
+            raise RuntimeError(
+                "Please configure GROQ_API_KEY or OPENAI_API_KEY in your Vercel Environment Variables."
+            )
+
+    llm_with_tools = llm.bind_tools(tools)
+
+    def chatbot(state: State):
+        return {"messages": llm_with_tools.invoke(state["messages"])}
+
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("chatbot", chatbot)
+    graph_builder.add_node("tools", ToolNode(tools=tools))
+    graph_builder.add_edge(START, "chatbot")
+    graph_builder.add_conditional_edges("chatbot", tools_condition)
+    graph_builder.add_edge("tools", "chatbot")
+
+    memory = MemorySaver()
+    _cached_graph = graph_builder.compile(checkpointer=memory)
+    return _cached_graph
+
+
+def chat_fn(message: str):
+    from langgraph.types import Command
+
+    graph = get_graph()
+
+    if _waiting_for_human["flag"]:
+        _waiting_for_human["flag"] = False
+        events = graph.stream(
+            Command(resume={"data": message}), _config, stream_mode="values"
+        )
+    else:
+        events = graph.stream(
+            {"messages": [{"role": "user", "content": message}]},
+            _config,
+            stream_mode="values",
+        )
+
+    last_message = None
+    for event in events:
+        if "messages" in event:
+            last_message = event["messages"][-1]
+
+    state = graph.get_state(_config)
+    if state.next:
+        _waiting_for_human["flag"] = True
+        pending = state.tasks[0].interrupts[0].value
+        return f"🤖 I need your help: {pending['query']}"
+
+    return last_message.content if last_message else "..."
 
 
 class ChatRequest(BaseModel):
     message: str
 
 
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.post("/api/chat")
 def chat_endpoint(req: ChatRequest):
-    response_text = chat_fn(req.message)
-    return {"response": response_text}
+    try:
+        response_text = chat_fn(req.message)
+        return {"response": response_text}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"response": f"Error: {str(e)}"})
 
 
 @app.get("/", response_class=HTMLResponse)
