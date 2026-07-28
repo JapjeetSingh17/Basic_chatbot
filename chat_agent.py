@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Annotated
 from typing_extensions import TypedDict
 
@@ -11,11 +12,15 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import Command, interrupt
 
-import gradio as gr
+from langchain_ollama import OllamaLLM
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import uvicorn
 
 load_dotenv()
 
-llm = init_chat_model(model="groq:llama-3.1-8b-instant")
+llm = OllamaLLM(model="llama3.1")
 
 
 class State(TypedDict):
@@ -56,14 +61,16 @@ graph_builder.add_edge("tools", "chatbot")
 memory = MemorySaver()
 graph = graph_builder.compile(checkpointer=memory)
 
-config = {"configurable": {"thread_id": "gradio-session"}}
+config = {"configurable": {"thread_id": "vercel-session"}}
 waiting_for_human = {"flag": False}
 
 
-def chat_fn(message, history):
+def chat_fn(message: str, history=None):
     if waiting_for_human["flag"]:
         waiting_for_human["flag"] = False
-        events = graph.stream(Command(resume={"data": message}), config, stream_mode="values")
+        events = graph.stream(
+            Command(resume={"data": message}), config, stream_mode="values"
+        )
     else:
         events = graph.stream(
             {"messages": [{"role": "user", "content": message}]},
@@ -85,11 +92,25 @@ def chat_fn(message, history):
     return last_message.content if last_message else "..."
 
 
-demo = gr.ChatInterface(
-    fn=chat_fn,
-    title="My LangGraph Agent",
-    description="Chat with your agent — powered by Groq + LangGraph",
-)
+# --- FastAPI Vercel Serverless Application ---
+app = FastAPI(title="LangGraph Agent - Vercel")
+HTML_FILE_PATH = Path(__file__).parent / "chat_agent_html.html"
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+@app.post("/api/chat")
+def chat_endpoint(req: ChatRequest):
+    response_text = chat_fn(req.message)
+    return {"response": response_text}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTML_FILE_PATH.read_text(encoding="utf-8")
+
 
 if __name__ == "__main__":
-    demo.launch()
+    uvicorn.run("chat_agent:app", host="0.0.0.0", port=8000, reload=True)
