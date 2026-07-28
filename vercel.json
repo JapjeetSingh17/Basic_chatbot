@@ -1,15 +1,8 @@
 {
-  "version": 2,
-  "builds": [
+  "rewrites": [
     {
-      "src": "chat_agent.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "chat_agent.py"
+      "source": "/(.*)",
+      "destination": "/api/index"
     }
   ]
 }
